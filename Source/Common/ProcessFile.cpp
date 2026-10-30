@@ -23,6 +23,9 @@ using namespace std::chrono;
 #ifdef ENABLE_AVFCTL
 #include "Common/AvfCtlWrapper.h"
 #endif
+#ifdef ENABLE_QTKITCTL
+#include "Common/QtkitCtlWrapper.h"
+#endif
 #ifdef ENABLE_LNX1394
 #include "Common/LinuxWrapper.h"
 #endif
@@ -242,6 +245,31 @@ return_value file::Parse(const String& FileName)
             }
         #endif
 
+        #ifdef ENABLE_QTKITCTL
+            for (size_t i = 0; i<QTKitCtlWrapper::GetDeviceCount(); i++)
+            {
+                auto Interface = QTKitCtlWrapper::Interface;
+                auto DeviceName = QTKitCtlWrapper::GetDeviceName(i);
+                auto DeviceID = QTKitCtlWrapper::GetDeviceID(i);
+                if (DeviceID.empty())
+                    continue;
+                if (Device_Command == 4) //JSON
+                    cout << (Count++ ? "," : "")
+                         << "{\"id\":\""
+                         << JSON_Encode(Trim(DeviceID))
+                         << "\",\"name\":\""
+                         << JSON_Encode(Trim(DeviceName))
+                         << "\",\"type\":\""
+                         << JSON_Encode(Trim(Interface))
+                         << "\"}";
+                else
+                {
+                    cout << DeviceID << ": " << DeviceName << " [" <<  Interface << "]" << '\n';
+                    Count++;
+                }
+            }
+        #endif
+
         #ifdef ENABLE_DECKLINK
             for (size_t i = 0; i<DecklinkWrapper::GetDeviceCount(); i++)
             {
@@ -387,6 +415,12 @@ return_value file::Parse(const String& FileName)
                 Capture = new AVFCtlWrapper(Device_Pos, Controller);
             else if (AVFCtlWrapper::GetDeviceIndex(Device) != (size_t)-1)
                 Capture = new AVFCtlWrapper(Device, Controller);
+            #endif
+            #ifdef ENABLE_QTKITCTL
+            else if ((Device_Pos-=Device_Offset) < (Device_Offset=QTKitCtlWrapper::GetDeviceCount()))
+                Capture = new QTKitCtlWrapper(Device_Pos, Controller);
+            else if (QTKitCtlWrapper::GetDeviceIndex(Device) != (size_t)-1)
+                Capture = new QTKitCtlWrapper(Device, Controller);
             #endif
             #ifdef ENABLE_DECKLINK
             else if ((Device_Pos-=Device_Offset) < (Device_Offset=DecklinkWrapper::GetDeviceCount()))

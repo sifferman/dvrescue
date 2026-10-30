@@ -12,6 +12,9 @@
 #include "Common/Output_Xml.h"
 #include "Common/Output_Webvtt.h"
 #include "ZenLib/Ztring.h"
+#ifdef ENABLE_QTKITCTL
+#include "Common/QtkitCtlWrapper.h"
+#endif
 #include <future>
 #include <mutex>
 #include <thread>
@@ -78,7 +81,12 @@ return_value Core::Process()
     while (!futures.empty())
     {
         auto it = futures.begin();
+        #ifdef ENABLE_QTKITCTL
+        QTKitCtlWrapper::RunMainThreadWork(0.1);
+        if (it->wait_for(0ms) != std::future_status::timeout)
+        #else
         if (it->wait_for(100ms) != std::future_status::timeout)
+        #endif
         {
            if (auto ToReturn2 = it->get())
                 ToReturn = ToReturn2;

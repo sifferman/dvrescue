@@ -586,7 +586,7 @@ bool dv_merge_private::TcSyncStart()
     auto Input_Count = Inputs.size();
 
     // Time code jumps - first frame
-    if (Frame_Pos)
+    if (Frame_Pos || Input_Count == 1)
         return false;
 
     // Look for first time code presence per input and minimum theoritical time code
