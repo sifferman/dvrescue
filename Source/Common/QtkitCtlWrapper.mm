@@ -180,6 +180,7 @@ static const UInt8 AudioSourcePackId = 0x50;
 static const UInt8 TwelveBitQuantization = 1;
 static const uint16_t TwelveBitErrorCode = 0x800;
 static const double MaximumSecondsBetweenMatchingVideoAndAudio = 0.017;
+static const size_t MaximumAudioBuffersKeptForBlankFrames = 60;
 static const double SecondsToWaitForMatchingAudio = 0.5;
 static const int AudioShuffle525[SequencesPerAudioChannelPair][AudioBlocksPerSequence] = {
     { 0, 30, 60, 20, 50, 80, 10, 40, 70 },
@@ -276,11 +277,31 @@ static void PackAudioIntoDvFrame(vector<uint8_t>& Frame, const vector<int16_t>& 
     }
 }
 
+static bool HasOwnSound(vector<uint8_t>& Frame)
+{
+    if (Frame.size() != NtscDvFrameSize || !HasTwelveBitAudio(&Frame[0]))
+        return true;
+    for (int Sequence = 0; Sequence < SequencesPerAudioChannelPair; Sequence++)
+        for (int AudioBlock = 0; AudioBlock < AudioBlocksPerSequence; AudioBlock++)
+        {
+            uint8_t* Data = FindAudioBlock(&Frame[0], Sequence, AudioBlock) + AudioDataOffset;
+            for (int SamplePair = 0; SamplePair < TwelveBitSamplePairsPerBlock; SamplePair++)
+            {
+                uint16_t Left = (Data[SamplePair * 3] << 4) | (Data[SamplePair * 3 + 2] >> 4);
+                uint16_t Right = (Data[SamplePair * 3 + 1] << 4) | (Data[SamplePair * 3 + 2] & 0x0F);
+                if ((Left && Left != TwelveBitErrorCode) || (Right && Right != TwelveBitErrorCode))
+                    return true;
+            }
+        }
+    return false;
+}
+
 struct PendingVideoFrame
 {
     vector<uint8_t> Bytes;
     double Seconds;
-    bool HasAudio;
+    CFAbsoluteTime ArrivalTime;
+    bool IsReady;
 };
 
 struct PendingAudio
@@ -301,9 +322,9 @@ static double ConvertToSeconds(QTTime Time)
     volatile CFAbsoluteTime LastFrameArrival;
     deque<PendingVideoFrame>* PendingVideoFrames;
     deque<PendingAudio>* PendingAudioBuffers;
-    size_t FramesPassedWithAudio;
-    size_t FramesPassedWithoutAudio;
-    size_t BuffersLogged;
+    size_t FramesWithOwnSound;
+    size_t FramesGivenSeparateSound;
+    size_t FramesWithoutSound;
 }
 - (void)passAllFrames;
 @end
@@ -330,10 +351,8 @@ static double ConvertToSeconds(QTTime Time)
 - (void)passFrontFrame
 {
     PendingVideoFrame& Frame = PendingVideoFrames->front();
-    if (Frame.HasAudio)
-        FramesPassedWithAudio++;
-    else
-        FramesPassedWithoutAudio++;
+    if (!Frame.IsReady)
+        FramesWithoutSound++;
     if (FrameConsumer)
         FrameConsumer->Parse_Buffer(&Frame.Bytes[0], Frame.Bytes.size());
     PendingVideoFrames->pop_front();
@@ -341,27 +360,28 @@ static double ConvertToSeconds(QTTime Time)
 
 - (void)packWaitingAudio
 {
-    for (deque<PendingAudio>::iterator Audio = PendingAudioBuffers->begin(); Audio != PendingAudioBuffers->end();)
+    for (deque<PendingVideoFrame>::iterator Frame = PendingVideoFrames->begin(); Frame != PendingVideoFrames->end(); ++Frame)
     {
-        deque<PendingVideoFrame>::iterator Frame = PendingVideoFrames->begin();
-        while (Frame != PendingVideoFrames->end() && (Frame->HasAudio || fabs(Frame->Seconds - Audio->Seconds) > MaximumSecondsBetweenMatchingVideoAndAudio))
-            ++Frame;
-        if (Frame == PendingVideoFrames->end())
-        {
-            ++Audio;
+        if (Frame->IsReady)
             continue;
-        }
-        PackAudioIntoDvFrame(Frame->Bytes, Audio->Samples);
-        Frame->HasAudio = true;
-        Audio = PendingAudioBuffers->erase(Audio);
+        for (deque<PendingAudio>::iterator Audio = PendingAudioBuffers->begin(); Audio != PendingAudioBuffers->end(); ++Audio)
+            if (fabs(Frame->Seconds - Audio->Seconds) <= MaximumSecondsBetweenMatchingVideoAndAudio)
+            {
+                PackAudioIntoDvFrame(Frame->Bytes, Audio->Samples);
+                Frame->IsReady = true;
+                FramesGivenSeparateSound++;
+                PendingAudioBuffers->erase(Audio);
+                break;
+            }
     }
 }
 
-- (void)passFramesReadyBefore:(double)OldestSecondsToKeepWaiting
+- (void)passFramesReady
 {
-    while (!PendingVideoFrames->empty() && (PendingVideoFrames->front().HasAudio || PendingVideoFrames->front().Seconds < OldestSecondsToKeepWaiting))
+    CFAbsoluteTime OldestArrivalToKeepWaiting = CFAbsoluteTimeGetCurrent() - SecondsToWaitForMatchingAudio;
+    while (!PendingVideoFrames->empty() && (PendingVideoFrames->front().IsReady || PendingVideoFrames->front().ArrivalTime < OldestArrivalToKeepWaiting))
         [self passFrontFrame];
-    while (!PendingAudioBuffers->empty() && PendingAudioBuffers->front().Seconds < OldestSecondsToKeepWaiting)
+    while (PendingAudioBuffers->size() > MaximumAudioBuffersKeptForBlankFrames)
         PendingAudioBuffers->pop_front();
 }
 
@@ -369,13 +389,12 @@ static double ConvertToSeconds(QTTime Time)
 {
     @synchronized(self) {
         [self packWaitingAudio];
-        size_t UnusedAudioBuffers = PendingAudioBuffers->size();
         while (!PendingVideoFrames->empty())
             [self passFrontFrame];
         PendingAudioBuffers->clear();
         if (getenv("DVRESCUE_QTKIT_AUDIO_LOG"))
-            NSLog(@"QTKit audio: %lu frames with audio, %lu without, %lu audio buffers unused",
-                  (unsigned long)FramesPassedWithAudio, (unsigned long)FramesPassedWithoutAudio, (unsigned long)UnusedAudioBuffers);
+            NSLog(@"QTKit sound: %lu frames kept their own, %lu used the separate sound, %lu had none",
+                  (unsigned long)FramesWithOwnSound, (unsigned long)FramesGivenSeparateSound, (unsigned long)FramesWithoutSound);
     }
 }
 
@@ -389,21 +408,13 @@ static double ConvertToSeconds(QTTime Time)
     double Seconds = ConvertToSeconds([SampleBuffer presentationTime]);
     NSString* MediaType = [Connection mediaType];
     @synchronized(self) {
-        BuffersLogged++;
-        if (getenv("DVRESCUE_QTKIT_AUDIO_LOG") && BuffersLogged % 31 == 0)
-        {
-            long SampleMagnitude = 0;
-            if ([MediaType isEqualToString:QTMediaTypeSound])
-                for (NSUInteger Index = 0; Index < Length / sizeof(int16_t); Index++)
-                    SampleMagnitude += abs(((const int16_t*)[SampleBuffer bytesForAllSamples])[Index]);
-            NSLog(@"QTKit buffer %@ at %.4f s, %lu bytes, sample magnitude %ld, format %@", MediaType, Seconds, (unsigned long)Length,
-                  SampleMagnitude, [[SampleBuffer formatDescription] localizedFormatSummary]);
-        }
         if ([MediaType isEqualToString:QTMediaTypeVideo])
         {
             LastFrameArrival = CFAbsoluteTimeGetCurrent();
             const uint8_t* Bytes = (const uint8_t*)[SampleBuffer bytesForAllSamples];
-            PendingVideoFrame Frame = { vector<uint8_t>(Bytes, Bytes + Length), Seconds, false };
+            PendingVideoFrame Frame = { vector<uint8_t>(Bytes, Bytes + Length), Seconds, LastFrameArrival, false };
+            Frame.IsReady = HasOwnSound(Frame.Bytes);
+            FramesWithOwnSound += Frame.IsReady;
             PendingVideoFrames->push_back(Frame);
         }
         else if ([MediaType isEqualToString:QTMediaTypeSound])
@@ -415,7 +426,7 @@ static double ConvertToSeconds(QTTime Time)
         else
             return;
         [self packWaitingAudio];
-        [self passFramesReadyBefore:Seconds - SecondsToWaitForMatchingAudio];
+        [self passFramesReady];
     }
 }
 @end
